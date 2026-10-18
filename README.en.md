@@ -1,21 +1,22 @@
 # gpt-watch
 
-A local-first dashboard for Codex: model usage, 5h/7d quota, capacity rejections, and active probes that catch silent model swaps. Pure Python stdlib; data stays on your machine.
+**Quickly detect when ChatGPT / Codex is being silently degraded.** When a requested model is quietly replaced by a smaller, older or weaker one, the UI may show nothing. gpt-watch uses local logs and active probes to catch it and keep evidence. Pure Python stdlib; data stays on your machine.
 
 [中文](README.md) | **English**
 
-![Dashboard](screenshots/panel-overview.png)
-
-## Features
-
-- **Usage & quota**: turns, tokens and duration per model / project, plus 5h / 7d quota levels and reset times.
-- **Anomalies**: capacity rejections, rate limits and network errors; the original message appears when you hover the type badge.
-- **Quick probe**: sends one minimal request and compares the requested and served model names.
-- **Deep canary**: identity fingerprint + knowledge cutoff / contemporaneity + reasoning depth + answer check, for swaps that also fake the self-reported model name.
-- **Probe history**: unified Pass / Fail / Uncertain results, searchable by model, type, result, time and verdict text; hover a result for the reason.
-- **Global toast**: probe progress/results, model-list errors and demo mode appear as a single line at the top, without shifting the page, and dismiss automatically.
+> A derivative of [ysh1112/codex-model-watch](https://github.com/ysh1112/codex-model-watch). Thanks to the original author **ysh1112**.
 
 ![Probe Testing](screenshots/panel-probe.png)
+
+## Why it matters
+
+Under capacity pressure or policy changes, ChatGPT / Codex may quietly route a request to a weaker model — sometimes even faking the model name in the response. Quality drops, but it is hard to tell whether the model got dumber or something else happened. gpt-watch turns "degradation" into verifiable data:
+
+- **Degradation detection**: a quick probe catches direct swaps; the deep canary uses identity fingerprints, knowledge cutoff / contemporaneity, reasoning depth and an answer check to catch swaps that also fake the self-report.
+- **Evidence & history**: every probe records requested → served and a unified Pass / Fail / Uncertain result; search by model, type, result, time or verdict text, and hover a result for the reason.
+- **Usage & quota**: turns, tokens and duration per model / project, plus 5h / 7d quota levels and capacity rejections, as supporting evidence.
+
+![Dashboard](screenshots/panel-overview.png)
 
 ## Quick start
 
@@ -71,13 +72,17 @@ python3 codex_model_watch.py --host 0.0.0.0 --no-open
 # From the same Wi-Fi: http://YOUR_LAN_IP:8787
 ```
 
-The UI follows the system theme (light / dark); on phones the top bar uses two rows and tables scroll horizontally.
+The UI follows the system theme (light / dark); on phones the top bar uses two rows and tables scroll horizontally. Probe progress and results use a single-line toast at the top without shifting the page.
 
 ## Privacy
 
 - Parsing, aggregation and storage happen on your machine; the dashboard binds to `127.0.0.1` by default.
 - The only outbound request is a probe you trigger manually (to your Codex backend or a relay you configure).
 - No credentials, telemetry or phone-home in the repository.
+
+## Credits
+
+This project is a derivative of [ysh1112/codex-model-watch](https://github.com/ysh1112/codex-model-watch). Thanks to the original author **ysh1112** for the open-source work. Probe and canary methodology also draws on public ideas from BazaarLink / LLMprobe-engine.
 
 ## License
 

@@ -902,9 +902,13 @@ def seed_demo(conn):
     for day in range(13, -1, -1):
         base = now - timedelta(days=day)
         n_turn = random.randint(25, 90)
-        # 剧情线：第 5 天起 astra 探针开始被偷换成 luna
-        swapped_day = day <= 5
-        q5 = max(0.0, min(100.0, 100 - day * random.uniform(6, 14)))
+        # 剧情线：只有第 1 天出现一次换绑窗口，其余大部分通过
+        swapped_day = day == 1
+        if day == 0:
+            q5, q7 = 65.0, 26.0
+        else:
+            q5 = max(0.0, min(100.0, 100 - day * random.uniform(6, 14)))
+            q7 = max(0.0, min(100.0, q5 * 0.4))
         for i in range(n_turn):
             r = random.random()
             acc = 0.0
@@ -927,7 +931,7 @@ def seed_demo(conn):
                           random.randint(8000, 180000), random.randint(1200, 9000),
                           err, "Selected model is at capacity. Please try a different model." if err == "capacity" else None))
         quota.append((base.strftime("%Y-%m-%dT%H:00:00Z"), round(q5, 1),
-                      round(min(100.0, q5 * 2.2), 1), "{}"))
+                      round(q7, 1), "{}"))
         if day % 2 == 0 or swapped_day:
             for hm in (9, 15, 21):
                 ts = base.replace(hour=hm, minute=random.randint(0, 59), second=0, microsecond=0)
