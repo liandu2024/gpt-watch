@@ -45,6 +45,12 @@ python3 codex_model_watch.py --demo   # 演示数据
 
 记录里的「原因」在结果上悬停查看。完整判定只代表探测那一刻；容量紧张时换绑是动态开关的。
 
+### 参考信号与证据
+
+快速探针会同时记录 `x-codex-turn-state` 的长度、`x-codex-safety-buffering-faster-model`、`request-id` 和 `cf-ray`。社区观察到 turn-state 长度与降级路由相关（例如个人号约 292 健康 / 312 降级），但这是**启发式**且可能随服务端变化，**不参与通过 / 不通过判定**；权威信号仍是「请求模型 = 返回模型」和金丝雀行为。
+
+探测记录右上角的「导出证据」可下载 JSON，包含请求 / 实际模型、耗时、判定、request-id、cf-ray 和 turn-state 长度，方便附到工单。
+
 ## 数据来源与限制
 
 - **日志侧**：解析 `turn_context`、`token_usage_record`、`task_complete`、`token_count`，得到实际模型、token、时长、错误与 5h/7d 额度。
@@ -82,7 +88,7 @@ python3 codex_model_watch.py --host 0.0.0.0 --no-open
 
 ## 致谢
 
-本项目基于 [ysh1112/codex-model-watch](https://github.com/ysh1112/codex-model-watch) 二次开发，感谢原作者 **ysh1112** 的开源工作。探针与金丝雀的方法也参考了 BazaarLink / LLMprobe-engine 的公开思路。
+本项目基于 [ysh1112/codex-model-watch](https://github.com/ysh1112/codex-model-watch) 二次开发，感谢原作者 **ysh1112** 的开源工作。探针与金丝雀的方法也参考了 BazaarLink / LLMprobe-engine 的公开思路，以及 [codex_state_monitor](https://github.com/YueDongSun/codex_state_monitor) 对 `x-codex-turn-state` / safety-buffering 头的公开分析。
 
 ## License
 

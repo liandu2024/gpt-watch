@@ -71,16 +71,21 @@ def db_connect(db_path):
     CREATE TABLE IF NOT EXISTS probes(
         ts TEXT PRIMARY KEY, requested TEXT, served TEXT, swapped INTEGER,
         latency_ms INTEGER, safety_header TEXT, error TEXT,
+        turn_state_len INTEGER, faster_model TEXT, request_id TEXT, cf_ray TEXT,
         kind TEXT DEFAULT 'quick');
     CREATE TABLE IF NOT EXISTS threads(
         thread_id TEXT PRIMARY KEY, requested TEXT);
     """)
-    # 2026-10 金丝雀列迁移：老库 ALTER 补列（新库 executescript 里没放，统一走这里）
+    # 探针列迁移：老库 ALTER 补列（新库 executescript 里没放，统一走这里）
     for ddl in ("ALTER TABLE probes ADD COLUMN ttft_ms INTEGER",
                 "ALTER TABLE probes ADD COLUMN reasoning INTEGER",
                 "ALTER TABLE probes ADD COLUMN answer TEXT",
                 "ALTER TABLE probes ADD COLUMN verdict TEXT",
-                "ALTER TABLE probes ADD COLUMN kind TEXT"):
+                "ALTER TABLE probes ADD COLUMN kind TEXT",
+                "ALTER TABLE probes ADD COLUMN turn_state_len INTEGER",
+                "ALTER TABLE probes ADD COLUMN faster_model TEXT",
+                "ALTER TABLE probes ADD COLUMN request_id TEXT",
+                "ALTER TABLE probes ADD COLUMN cf_ray TEXT"):
         try:
             conn.execute(ddl)
         except sqlite3.OperationalError:
@@ -293,10 +298,15 @@ def run_probe(codex_home, model):
                  ("User-Agent", "codex_cli_rs/0.154.0")]:
         req.add_header(k, v)
     t0 = time.time()
-    served, safety, error = "", "", None
+    served, safety, faster, turn_state, request_id, cf_ray, error = "", "", "", "", "", "", None
     try:
         resp = urllib.request.urlopen(req, timeout=90)
         safety = resp.headers.get("x-codex-safety-buffering-enabled", "") or ""
+        faster = resp.headers.get("x-codex-safety-buffering-faster-model", "") or ""
+        turn_state = resp.headers.get("x-codex-turn-state", "") or ""
+        request_id = (resp.headers.get("x-request-id") or resp.headers.get("request-id")
+                      or resp.headers.get("openai-request-id") or "")
+        cf_ray = resp.headers.get("cf-ray", "") or ""
         buf = b""
         while True:
             chunk = resp.read(4096)
@@ -323,14 +333,19 @@ def run_probe(codex_home, model):
         error = str(e)[:200]
     latency = int((time.time() - t0) * 1000)
     swapped = 1 if (served and model and served != model) else 0
-    row = (iso_now(), model, served, swapped, latency, safety, error)
+    turn_state_len = len(turn_state) if turn_state else None
+    row = (iso_now(), model, served, swapped, latency, safety, error,
+           turn_state_len, faster, request_id, cf_ray)
     conn = db_connect(db_path())
     with g_lock:
-        conn.execute("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error, kind) "
-                     "VALUES(?,?,?,?,?,?,?,'quick')", row)
+        conn.execute("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error, "
+                     "kind, turn_state_len, faster_model, request_id, cf_ray) "
+                     "VALUES(?,?,?,?,?,?,?,'quick',?,?,?,?)", row)
         conn.commit()
     return {"ts": row[0], "requested": model, "served": served, "swapped": bool(swapped),
-            "latency_ms": latency, "safety_header": safety, "error": error}
+            "latency_ms": latency, "safety_header": safety, "error": error,
+            "turn_state_len": turn_state_len, "faster_model": faster,
+            "request_id": request_id, "cf_ray": cf_ray}
 
 
 # ---------------------------------------------------------------- 深度金丝雀
@@ -803,6 +818,9 @@ def api_data(conn, days=0, pages=None, probe_q=""):
             row.get("verdict") or "", row.get("error") or "", row.get("answer") or "",
             str(row.get("latency_ms") or ""), str(row.get("ttft_ms") or ""),
             str(row.get("reasoning") or ""),
+            str(row.get("turn_state_len") or ""),
+            row.get("faster_model") or "", row.get("request_id") or "",
+            row.get("cf_ray") or "", row.get("safety_header") or "",
             "自报" if kind != "quick" else "",
             ("偷换" if row.get("swapped") else "一致") if kind == "quick" else "",
         ]).lower()
@@ -1029,6 +1047,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/models":
             self._json(available_models(g_args.codex_home))
+            return
+        if path == "/api/probes/export":
+            with g_lock:
+                probes = [dict(row) for row in conn().execute(
+                    "SELECT * FROM probes ORDER BY ts DESC").fetchall()]
+            payload = json.dumps({"exported_at": iso_now(), "count": len(probes),
+                                  "probes": probes}, ensure_ascii=False, indent=2).encode()
+            filename = "gpt-watch-probes-%s.json" % datetime.now().strftime("%Y%m%d-%H%M%S")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="%s"' % filename)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(payload)
             return
         if path == "/api/data":
             global g_last_scan

@@ -45,6 +45,12 @@ Open <http://127.0.0.1:8787>. On startup it incrementally scans `~/.codex/sessio
 
 Hover a result to read the reason. A verdict describes that moment only; swapping can change with capacity.
 
+### Reference signals and evidence
+
+The quick probe also records the `x-codex-turn-state` length, `x-codex-safety-buffering-faster-model`, `request-id` and `cf-ray`. Community reports correlate turn-state length with degraded routing (e.g. roughly 292 healthy / 312 degraded on personal plans), but this is a **heuristic** and may change with the server; it **does not affect the Pass / Fail / Uncertain verdict**. The authoritative signal remains requested model == served model plus canary behavior.
+
+Use **Export evidence** at the top right of the probe history to download a JSON file with requested / served models, latency, verdict, request-id, cf-ray and turn-state length — ready to attach to a support ticket.
+
 ## Data and limits
 
 - **Log side**: parses `turn_context`, `token_usage_record`, `task_complete` and `token_count` for the effective model, tokens, duration, errors and 5h/7d quota.
@@ -82,7 +88,7 @@ The UI follows the system theme (light / dark); on phones the top bar uses two r
 
 ## Credits
 
-This project is a derivative of [ysh1112/codex-model-watch](https://github.com/ysh1112/codex-model-watch). Thanks to the original author **ysh1112** for the open-source work. Probe and canary methodology also draws on public ideas from BazaarLink / LLMprobe-engine.
+This project is a derivative of [ysh1112/codex-model-watch](https://github.com/ysh1112/codex-model-watch). Thanks to the original author **ysh1112** for the open-source work. Probe and canary methodology also draws on public ideas from BazaarLink / LLMprobe-engine, and on [codex_state_monitor](https://github.com/YueDongSun/codex_state_monitor)'s public analysis of the `x-codex-turn-state` / safety-buffering headers.
 
 ## License
 

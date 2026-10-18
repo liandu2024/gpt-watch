@@ -98,11 +98,15 @@ try {
   .panel h2{font-size:18px;color:var(--txt);font-weight:650;line-height:1.4;margin-bottom:18px;letter-spacing:-.3px}
   .panel-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:18px}
   .panel-heading h2{margin:0}
-  .probe-search{position:relative;display:flex;align-items:center;flex:0 1 340px;min-width:240px;max-width:360px}
+  .probe-search{position:relative;display:flex;align-items:center;flex:0 0 340px;min-width:240px;max-width:360px}
   .probe-search svg{position:absolute;left:13px;width:18px;height:18px;color:var(--dim);pointer-events:none}
   .probe-search input{width:100%;min-height:42px;padding:8px 14px 8px 38px;border:1px solid var(--border);border-radius:99px;background:var(--bg);color:var(--txt);font-size:14px;outline-offset:2px}
   .probe-search input::placeholder{color:var(--dim);opacity:1}
   .probe-search input:focus-visible{outline-width:2px;outline-offset:1px}
+  .probe-tools{display:flex;align-items:center;gap:10px;margin-left:auto;min-width:0}
+  .exportbtn{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:42px;padding:8px 14px;border:1px solid var(--border);border-radius:99px;background:var(--bg);color:var(--txt);font-size:14px;font-weight:500;white-space:nowrap;text-decoration:none}
+  .exportbtn svg{width:18px;height:18px;color:var(--dim)}
+  .exportbtn:hover{border-color:var(--border2);background:var(--card2)}
   .grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}
   .chart-wrap{position:relative;height:270px;min-width:0}
   .chart-wrap canvas{display:block;max-width:100%;max-height:100%}
@@ -234,6 +238,10 @@ try {
     .qbar{grid-template-columns:28px minmax(0,1fr) 48px;gap:10px}.qbar .hint{grid-column:2 / 4}
     .probe-form{display:grid;grid-template-columns:1fr 1fr;gap:12px}.model-field{grid-column:1 / -1;min-width:0}
     .probe-search{flex:1 1 100%;max-width:none;min-width:0}
+    .probe-tools{flex:1 1 100%;flex-wrap:nowrap}
+    .probe-tools .probe-search{flex:1 1 auto;min-width:0}
+    .exportbtn{width:42px;min-height:42px;padding:0;flex:0 0 42px}
+    .exportbtn span{display:none}
     button.pgo{padding:12px 8px;font-size:15px}
     .help-dialog{width:calc(100vw - 24px);border-radius:20px}
     .help-dialog-head,.help-list,.help-dialog-actions{padding-left:18px;padding-right:18px}
@@ -300,7 +308,7 @@ try {
         <p class="hint model-note" id="modelNote">支持按名称或 ID 搜索</p>
       </section>
       <section class="panel">
-        <div class="panel-heading"><h2>探测记录</h2><label class="probe-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input id="probeSearch" type="search" placeholder="搜索模型、类型、结果、时间…" aria-label="搜索探测记录" autocomplete="off" spellcheck="false" enterkeyhint="search"></label></div>
+        <div class="panel-heading"><h2>探测记录</h2><div class="probe-tools"><a class="exportbtn" href="/api/probes/export" download aria-label="导出全部探测证据（JSON）" title="导出全部探测证据（JSON）"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg><span>导出证据</span></a><label class="probe-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input id="probeSearch" type="search" placeholder="搜索模型、类型、结果、时间…" aria-label="搜索探测记录" autocomplete="off" spellcheck="false" enterkeyhint="search"></label></div></div>
         <div class="legend"><span><i class="sq ok"></i>通过</span><span><i class="sq swap"></i>不通过</span><span><i class="sq err"></i>不确定</span></div>
         <div class="squares" id="pSquares" role="img" aria-label="最近 60 次探测结果，颜色表示通过、不通过或不确定"></div>
         <div class="table-wrap" role="region" aria-label="探测记录，可横向滚动" tabindex="0"><table id="tProbe" class="data-table" aria-label="探测记录"></table></div>
@@ -564,17 +572,30 @@ function probeKind(p){
   if(PROBE_KIND[p.kind]) return p.kind;
   return p.verdict?'canary':'quick';
 }
-function probeReason(p,kind){
-  if(kind==='quick'){
-    if(p.error) return `探测失败：${p.error}${p.latency_ms?` · 耗时 ${fmtDur(p.latency_ms)}`:''}`;
-    if(!p.served) return '没有拿到响应模型。';
-    return `请求 ${p.requested} → 实际 ${p.served}${p.swapped?' · 请求与返回不一致':''}${p.latency_ms?` · 耗时 ${fmtDur(p.latency_ms)}`:''}`;
-  }
-  const parts=[`判定：${p.verdict||'无'}`];
-  if(p.ttft_ms!=null) parts.push(`首字 ${p.ttft_ms}ms`);
-  if(p.reasoning!=null) parts.push(`推理 ${p.reasoning}`);
-  if(p.error) parts.push(`错误：${p.error}`);
+function probeEvidence(p){
+  const parts=[];
+  if(p.safety_header) parts.push(`safety ${p.safety_header}`);
+  if(p.faster_model) parts.push(`faster-model ${p.faster_model}`);
+  if(p.turn_state_len!=null) parts.push(`turn-state ${p.turn_state_len}（参考）`);
+  if(p.request_id) parts.push(`request-id ${p.request_id}`);
+  if(p.cf_ray) parts.push(`cf-ray ${p.cf_ray}`);
   return parts.join(' · ');
+}
+function probeReason(p,kind){
+  let base;
+  if(kind==='quick'){
+    if(p.error) base=`探测失败：${p.error}${p.latency_ms?` · 耗时 ${fmtDur(p.latency_ms)}`:''}`;
+    else if(!p.served) base='没有拿到响应模型。';
+    else base=`请求 ${p.requested} → 实际 ${p.served}${p.swapped?' · 请求与返回不一致':''}${p.latency_ms?` · 耗时 ${fmtDur(p.latency_ms)}`:''}`;
+  }else{
+    const parts=[`判定：${p.verdict||'无'}`];
+    if(p.ttft_ms!=null) parts.push(`首字 ${p.ttft_ms}ms`);
+    if(p.reasoning!=null) parts.push(`推理 ${p.reasoning}`);
+    if(p.error) parts.push(`错误：${p.error}`);
+    base=parts.join(' · ');
+  }
+  const evidence=probeEvidence(p);
+  return evidence?`${base} · ${evidence}`:base;
 }
 function probeResult(p){
   const kind=probeKind(p);
