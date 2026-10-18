@@ -1,4 +1,4 @@
-# codex-model-watch
+# gpt-watch
 
 [中文](README.md) | **English**
 
@@ -72,8 +72,8 @@ click, or schedule it (e.g. every 2 hours) to observe swap windows over time.
 Requires Python 3.8+ (standard library only — nothing to pip install). Windows / macOS / Linux.
 
 ```bash
-git clone https://github.com/<you>/codex-model-watch.git
-cd codex-model-watch
+git clone https://github.com/liandu2024/gpt-watch.git
+cd gpt-watch
 
 # Start with your real data (scans local session logs, opens the browser)
 python codex_model_watch.py

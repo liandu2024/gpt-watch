@@ -1,4 +1,4 @@
-# codex-model-watch
+# gpt-watch
 
 本地监控 Codex 的模型使用、5h/7d 额度水位与容量拒单，并用探针即时验证「请求 A 却被悄悄换成 B」的模型偷换。纯 Python 标准库，数据不出本机。
 
@@ -68,8 +68,8 @@ Codex 会把每一轮会话事件写入本地文件：
 要求：Python 3.8+（仅标准库，无需 pip install 任何东西）。Windows / macOS / Linux 均可。
 
 ```bash
-git clone https://github.com/<you>/codex-model-watch.git
-cd codex-model-watch
+git clone https://github.com/liandu2024/gpt-watch.git
+cd gpt-watch
 
 # 用真实数据启动（自动扫描本地会话日志并打开浏览器）
 python codex_model_watch.py
