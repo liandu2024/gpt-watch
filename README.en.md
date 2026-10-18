@@ -90,6 +90,7 @@ Your browser opens `http://127.0.0.1:8787` automatically.
 
 | Option | Description |
 |---|---|
+| `--host 127.0.0.1` | Loopback by default; use `0.0.0.0` for access from computers and phones on your LAN |
 | `--port 8787` | Local dashboard port |
 | `--max-age-days 30` | Only parse the last N days of logs; `0` = everything (first full scan can be slow) |
 | `--codex-home PATH` | Codex home directory (default `~/.codex`) |
@@ -100,17 +101,50 @@ Your browser opens `http://127.0.0.1:8787` automatically.
 The database lives at `~/.codex-model-watch/state.db` (SQLite). Repeated starts parse
 incrementally — nothing is counted twice.
 
+### Appearance and mobile access
+
+The appearance selector offers System (the default), Light, and Dark, remembers your choice
+in the current browser, and updates chart colors. The top bar shows Probe Testing first
+(the default), then Monitoring (`/#probe` and `/#monitor`). The model dropdown reads the
+local Codex `models_cache.json`, filters hidden models, and follows catalog priority.
+Its custom popup supports name / ID search, keyboard selection, and an empty-result state,
+with 20px of padding after the chevron.
+The refresh button also reloads the model list. On phones the top bar uses two rows,
+with larger touch targets and tables that scroll inside their cards.
+
+All four data tables use independent server-side pagination with 10 rows per page.
+Controls appear only above 10 rows; historical data is no longer truncated at 15 / 50 / 100
+rows. Changing the statistics time range resets the affected tables to their first page.
+The `?` button at the top right of "Run a probe" explains Quick Probe vs Deep Canary in a
+dialog. Probe records now carry a **Type** column and a unified **Pass / Fail / Uncertain**
+result; the detailed verdict appears on hover instead of filling the row. Probe records have
+a search box on the right that filters by model, type, result (pass / fail / uncertain), time,
+verdict text, and other keywords. Probe progress and results, model-list errors, and the demo
+notice all appear as a single-line glass banner pinned to the top of the page (over the top
+bar), truncate long text with an ellipsis, and dismiss automatically, so they no longer shift
+page content. The Recent errors
+table drops the message column — hover the type badge to read the original message — and the
+appearance theme uses a custom dropdown that opens below its button.
+
+```bash
+python3 codex_model_watch.py --host 0.0.0.0 --no-open
+```
+
+From another device on the same Wi-Fi / LAN, open `http://YOUR_COMPUTERS_LAN_IP:8787`.
+LAN clients can view statistics and trigger probes using this computer's account.
+Enable this only on trusted networks and do not forward the port to the public internet.
+
 ## Using the probe
 
 1. Log in with Codex normally once (so `~/.codex/auth.json` exists and is fresh);
-2. Open the dashboard, type the model to verify in the "偷换探针" section (e.g. `gpt-6-astra`);
+2. Open Probe Testing and select a model from the dropdown. If the list is empty, open Codex and click the dashboard refresh button;
 3. Click the probe button — within seconds you get **requested X → actually served Y**;
 4. Probe history accumulates into a swap rate; schedule it (e.g. every 2 hours) to map the
    swap windows across the day.
 
 ## Privacy
 
-- All parsing, aggregation and storage happen on your machine; the dashboard binds to `127.0.0.1` only;
+- All parsing, aggregation and storage happen on your machine; the dashboard binds to `127.0.0.1` by default, with optional LAN access via `--host`;
 - The only outbound request is the **probe you trigger manually** (to your own Codex backend);
 - No credentials, telemetry or phone-home anywhere in the code.
 

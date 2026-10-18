@@ -70,7 +70,8 @@ def db_connect(db_path):
         ts TEXT PRIMARY KEY, primary_used REAL, secondary_used REAL, raw TEXT);
     CREATE TABLE IF NOT EXISTS probes(
         ts TEXT PRIMARY KEY, requested TEXT, served TEXT, swapped INTEGER,
-        latency_ms INTEGER, safety_header TEXT, error TEXT);
+        latency_ms INTEGER, safety_header TEXT, error TEXT,
+        kind TEXT DEFAULT 'quick');
     CREATE TABLE IF NOT EXISTS threads(
         thread_id TEXT PRIMARY KEY, requested TEXT);
     """)
@@ -78,11 +79,21 @@ def db_connect(db_path):
     for ddl in ("ALTER TABLE probes ADD COLUMN ttft_ms INTEGER",
                 "ALTER TABLE probes ADD COLUMN reasoning INTEGER",
                 "ALTER TABLE probes ADD COLUMN answer TEXT",
-                "ALTER TABLE probes ADD COLUMN verdict TEXT"):
+                "ALTER TABLE probes ADD COLUMN verdict TEXT",
+                "ALTER TABLE probes ADD COLUMN kind TEXT"):
         try:
             conn.execute(ddl)
         except sqlite3.OperationalError:
             pass  # 列已存在
+    # 老记录补类型：带 verdict 的是金丝雀；电池/识别历史记录按请求名后缀还原。
+    conn.execute("""
+        UPDATE probes SET kind = CASE
+            WHEN requested LIKE '%[电池]' THEN 'battery'
+            WHEN requested LIKE '%[识别]' THEN 'identify'
+            WHEN verdict IS NOT NULL AND verdict <> '' THEN 'canary'
+            ELSE 'quick' END
+        WHERE kind IS NULL OR kind = ''""")
+    conn.commit()
     return conn
 
 
@@ -315,8 +326,8 @@ def run_probe(codex_home, model):
     row = (iso_now(), model, served, swapped, latency, safety, error)
     conn = db_connect(db_path())
     with g_lock:
-        conn.execute("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error) "
-                     "VALUES(?,?,?,?,?,?,?)", row)
+        conn.execute("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error, kind) "
+                     "VALUES(?,?,?,?,?,?,?,'quick')", row)
         conn.commit()
     return {"ts": row[0], "requested": model, "served": served, "swapped": bool(swapped),
             "latency_ms": latency, "safety_header": safety, "error": error}
@@ -469,7 +480,7 @@ def run_identify(model, codex_home, api_base=None, api_key=None,
     conn_ = db_connect(db_path())
     with g_lock:
         conn_.execute("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error, "
-                      "ttft_ms, reasoning, answer, verdict) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                      "ttft_ms, reasoning, answer, verdict, kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,'identify')",
                       (row_ts, model + "[识别]", model, 0, None, "", None, None, None,
                        json.dumps([(r["ref"], r["score"]) for r in ok], ensure_ascii=False)[:110],
                        "identify: " + verdict))
@@ -621,7 +632,7 @@ def run_battery(model, codex_home, api_base=None, api_key=None, ref_model=None):
     conn_ = db_connect(db_path())
     with g_lock:
         conn_.execute("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error, "
-                      "ttft_ms, reasoning, answer, verdict) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                      "ttft_ms, reasoning, answer, verdict, kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,'battery')",
                       (row_ts, model + "[电池]", model, 0, None, "", None, None, None,
                        json.dumps({"horizon": tgt["horizon"], "cliff": tgt["cliff"],
                                    "style": tgt["style"], "randoms": tgt["randoms"][:4]},
@@ -722,7 +733,7 @@ def run_canary(model, codex_home, api_base=None, api_key=None):
     conn_ = db_connect(db_path())
     with g_lock:
         conn_.execute("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error, "
-                      "ttft_ms, reasoning, answer, verdict) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                      "ttft_ms, reasoning, answer, verdict, kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,'canary')",
                       (row_ts, model, model, 0, ttft_ms, "", error, ttft_ms, reasoning,
                        ("自报:" + sk_text.replace("\n", " ")[:60] + " | 答:" + (answer or "")[-40:])[:120],
                        verdict))
@@ -735,13 +746,86 @@ def run_canary(model, codex_home, api_base=None, api_key=None):
 
 # ---------------------------------------------------------------- 聚合输出
 
-def api_data(conn, days=0):
+def api_data(conn, days=0, pages=None, probe_q=""):
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     cutoff = ""
     if days and days > 0:
-        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def q(sql, args=()):
         return [dict(r) for r in conn.execute(sql, args).fetchall()]
+
+    probe_kind_labels = {"quick": "快速", "canary": "金丝雀",
+                         "battery": "指纹电池", "identify": "精准识别"}
+    probe_status_words = {
+        "通过": "pass", "pass": "pass", "一致": "pass",
+        "不通过": "fail", "fail": "fail", "偷换": "fail", "被偷换": "fail", "可疑": "fail",
+        "不确定": "unknown", "unknown": "unknown", "失败": "unknown",
+    }
+
+    def probe_kind(row):
+        kind = row.get("kind")
+        if kind in probe_kind_labels:
+            return kind
+        return "canary" if row.get("verdict") else "quick"
+
+    def probe_state(row):
+        kind = probe_kind(row)
+        verdict = (row.get("verdict") or "").lower()
+        if kind == "quick":
+            if row.get("error") or not row.get("served"):
+                return "unknown"
+            return "fail" if row.get("swapped") else "pass"
+        if verdict.startswith("suspect"):
+            return "fail"
+        if (row.get("error") or not verdict or verdict.startswith("unknown")
+                or verdict.startswith("partial") or "答错" in verdict):
+            return "unknown"
+        return "pass"
+
+    def probe_matches(row, query):
+        tokens = query.lower().split()
+        if not tokens:
+            return True
+        state = probe_state(row)
+        wanted = {probe_status_words[t] for t in tokens if t in probe_status_words}
+        if wanted and state not in wanted:
+            return False
+        words = [t for t in tokens if t not in probe_status_words]
+        if not words:
+            return True
+        kind = probe_kind(row)
+        ts = row.get("ts") or ""
+        haystack = " ".join([
+            ts, ts[:16].replace("T", " "), ts[5:16].replace("T", " "),
+            row.get("requested") or "", row.get("served") or "",
+            kind, probe_kind_labels.get(kind, ""),
+            row.get("verdict") or "", row.get("error") or "", row.get("answer") or "",
+            str(row.get("latency_ms") or ""), str(row.get("ttft_ms") or ""),
+            str(row.get("reasoning") or ""),
+            "自报" if kind != "quick" else "",
+            ("偷换" if row.get("swapped") else "一致") if kind == "quick" else "",
+        ]).lower()
+        return all(word in haystack for word in words)
+
+    pagination = {}
+
+    def page_offset(key, total):
+        page_size = 10
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        try:
+            page = int((pages or {}).get(key, 1))
+        except (TypeError, ValueError):
+            page = 1
+        page = max(1, min(page, total_pages))
+        pagination[key] = {"page": page, "pages": total_pages,
+                           "total": total, "page_size": page_size}
+        return (page - 1) * page_size
+
+    def paged_query(key, sql, args=()):
+        total = conn.execute("SELECT COUNT(*) FROM (" + sql + ")", args).fetchone()[0]
+        offset = page_offset(key, total)
+        return q(sql + " LIMIT ? OFFSET ?", tuple(args) + (10, offset))
 
     cov = conn.execute("SELECT MIN(ts) a, MAX(ts) b, COUNT(*) n FROM turns WHERE ts IS NOT NULL").fetchone()
     win = conn.execute("""SELECT COUNT(*) turns,
@@ -758,23 +842,34 @@ def api_data(conn, days=0):
                          COALESCE(SUM(in_tokens),0) tin, COALESCE(SUM(out_tokens),0) tout,
                          AVG(duration_ms) avg_dur,
                          SUM(CASE WHEN error_kind IS NOT NULL THEN 1 ELSE 0 END) errors
-                  FROM turns WHERE (?='' OR ts>=?) GROUP BY model ORDER BY turns DESC""", (cutoff, cutoff))
-    projects = q("""SELECT COALESCE(NULLIF(project,''),'(未知)') project, COUNT(*) turns,
+                  FROM turns WHERE (?='' OR ts>=?) GROUP BY model ORDER BY turns DESC, model""", (cutoff, cutoff))
+    projects = paged_query("projects", """SELECT COALESCE(NULLIF(project,''),'(未知)') project, COUNT(*) turns,
                            COALESCE(SUM(in_tokens+out_tokens),0) tokens
-                    FROM turns WHERE (?='' OR ts>=?) GROUP BY project ORDER BY tokens DESC LIMIT 15""",
+                    FROM turns WHERE (?='' OR ts>=?) GROUP BY project ORDER BY tokens DESC, project""",
                  (cutoff, cutoff))
-    errors_recent = q("""SELECT ts, COALESCE(NULLIF(served,''),'(未知)') model, error_kind, error_msg
+    errors_recent = paged_query("errors", """SELECT ts, COALESCE(NULLIF(served,''),'(未知)') model, error_kind, error_msg
                          FROM turns WHERE error_kind IS NOT NULL AND (?='' OR ts>=?)
-                         ORDER BY ts DESC LIMIT 50""", (cutoff, cutoff))
+                         ORDER BY ts DESC, file, turn_id""", (cutoff, cutoff))
     quota_latest = q("SELECT * FROM quota ORDER BY ts DESC LIMIT 1")
     quota_hist = q("SELECT ts, primary_used, secondary_used FROM quota ORDER BY ts DESC LIMIT 48")
-    probes = q("SELECT * FROM probes ORDER BY ts DESC LIMIT 100")
+    all_probes = q("SELECT * FROM probes ORDER BY ts DESC")
+    if (probe_q or "").strip():
+        all_probes = [p for p in all_probes if probe_matches(p, probe_q)]
+    probe_offset = page_offset("probes", len(all_probes))
+    probes = all_probes[probe_offset:probe_offset + 10]
+    probe_recent = all_probes[:60]
     probe_summary = conn.execute("""SELECT COUNT(*) n, COALESCE(SUM(swapped),0) swapped,
+                                    COALESCE(SUM(CASE WHEN kind = 'quick' OR kind IS NULL OR kind = ''
+                                                      THEN 1 ELSE 0 END),0) quick,
+                                    COALESCE(SUM(CASE WHEN kind IN ('canary','battery','identify')
+                                                      THEN 1 ELSE 0 END),0) canary,
                                     COALESCE(SUM(CASE WHEN verdict LIKE 'suspect%' THEN 1 ELSE 0 END),0) suspect
                                     FROM probes""").fetchone()
     total_models = sum(m["turns"] for m in models) or 1
     for m in models:
         m["share"] = round(m["turns"] * 100.0 / total_models, 1)
+    model_offset = page_offset("models", len(models))
+    models = models[model_offset:model_offset + 10]
     return {
         "meta": {"generated_at": iso_now(), "demo": g_state["demo"]},
         "coverage": {"first": cov["a"], "last": cov["b"], "turns_total": cov["n"]},
@@ -786,8 +881,9 @@ def api_data(conn, days=0):
         "errors_recent": errors_recent,
         "quota": {"latest": quota_latest[0] if quota_latest else None,
                   "history": list(reversed(quota_hist))},
-        "probes": probes,
+        "probes": probes, "probe_recent": probe_recent, "pagination": pagination,
         "probe_summary": {"total": probe_summary["n"], "swapped": probe_summary["swapped"],
+                          "quick": probe_summary["quick"], "canary": probe_summary["canary"],
                           "suspect": probe_summary["suspect"]},
     }
 
@@ -835,22 +931,62 @@ def seed_demo(conn):
         if day % 2 == 0 or swapped_day:
             for hm in (9, 15, 21):
                 ts = base.replace(hour=hm, minute=random.randint(0, 59), second=0, microsecond=0)
-                probes.append((ts.strftime("%Y-%m-%dT%H:%M:%SZ"), "gpt-6-astra",
-                               "gpt-5.6-luna" if swapped_day else "gpt-6-astra",
-                               1 if swapped_day else 0, random.randint(900, 4000),
-                               "true" if swapped_day else "", None))
+                ts_text = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+                if hm == 15:
+                    # 金丝雀样例：真旗舰慢而深，被换的轻量模型秒回浅答
+                    verdict = "suspect(快而浅)" if swapped_day else "ok"
+                    probes.append((ts_text, "gpt-6-astra", "gpt-6-astra", 0,
+                                   1200 if swapped_day else 6400, "", None,
+                                   1200 if swapped_day else 6400,
+                                   25 if swapped_day else 320, "答:44", verdict, "canary"))
+                else:
+                    probes.append((ts_text, "gpt-6-astra",
+                                   "gpt-5.6-luna" if swapped_day else "gpt-6-astra",
+                                   1 if swapped_day else 0, random.randint(900, 4000),
+                                   "true" if swapped_day else "", None,
+                                   None, None, None, None, "quick"))
     conn.executemany("""INSERT INTO turns(file, turn_id, ts, session_id, project, requested, served, effort,
                         in_tokens, cached_tokens, out_tokens, duration_ms, ttft_ms, error_kind, error_msg)
                         VALUES('demo', ?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(file, turn_id) DO NOTHING""",
                      [(t[0],) + t[1:] for t in turns])
     conn.executemany("INSERT INTO quota VALUES(?,?,?,?) ON CONFLICT(ts) DO NOTHING", quota)
-    conn.executemany("INSERT INTO probes VALUES(?,?,?,?,?,?,?) ON CONFLICT(ts) DO NOTHING", probes)
+    conn.executemany("""INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error,
+                        ttft_ms, reasoning, answer, verdict, kind)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(ts) DO NOTHING""", probes)
     conn.commit()
 
 
 # ---------------------------------------------------------------- HTTP 服务
 
 WEB_HTML = None
+
+
+def available_models(codex_home):
+    """只返回 Codex 本机模型缓存中可展示的名称，不暴露缓存中的账号与指令。"""
+    try:
+        with open(os.path.join(codex_home, "models_cache.json"), encoding="utf-8") as handle:
+            cache = json.load(handle)
+        entries = cache.get("models", []) if isinstance(cache, dict) else []
+        if not isinstance(entries, list):
+            entries = []
+    except (OSError, ValueError):
+        entries = []
+    entries = [entry for entry in entries if isinstance(entry, dict)]
+    entries.sort(key=lambda entry: entry.get("priority")
+                 if isinstance(entry.get("priority"), (int, float)) else float("inf"))
+    models, seen = [], set()
+    for entry in entries:
+        slug = entry.get("slug")
+        if (not isinstance(slug, str) or not slug.strip() or slug in seen
+                or entry.get("visibility") != "list"):
+            continue
+        name = entry.get("display_name")
+        models.append({"id": slug, "name": name if isinstance(name, str) and name else slug})
+        seen.add(slug)
+    result = {"models": models}
+    if not models:
+        result["error"] = "暂未获取到模型列表，请打开 Codex 后刷新重试。"
+    return result
 
 
 def load_index():
@@ -887,6 +1023,9 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
+        if path == "/api/models":
+            self._json(available_models(g_args.codex_home))
+            return
         if path == "/api/data":
             global g_last_scan
             qs = urllib.parse.parse_qs(parsed.query)
@@ -894,11 +1033,14 @@ class Handler(BaseHTTPRequestHandler):
                 days = int((qs.get("days") or ["0"])[0])
             except ValueError:
                 days = 0
+            probe_q = (qs.get("probe_q") or [""])[0][:120]
             with g_lock:
                 if not g_state["demo"] and time.time() - g_last_scan > 20:
                     scan_sessions(conn(), g_args.codex_home, g_args.max_age_days)
                     g_last_scan = time.time()
-                self._json(api_data(conn(), days))
+                pages = {key: (qs.get(key + "_page") or ["1"])[0]
+                         for key in ("models", "projects", "errors", "probes")}
+                self._json(api_data(conn(), days, pages, probe_q))
             return
         self.send_response(404)
         self.end_headers()
@@ -953,6 +1095,7 @@ def db_path():
 def main():
     global g_args, g_last_scan
     ap = argparse.ArgumentParser(description="codex-model-watch —— 本地监控 Codex 模型使用/额度/拒单，并探测模型偷换")
+    ap.add_argument("--host", default="127.0.0.1", help="监听地址，局域网访问使用 0.0.0.0（默认 127.0.0.1）")
     ap.add_argument("--port", type=int, default=8787, help="本地网页端口（默认 8787）")
     ap.add_argument("--codex-home", default=os.path.join(HOME, ".codex"), help="Codex 主目录（默认 ~/.codex）")
     ap.add_argument("--max-age-days", type=int, default=30, help="只解析最近 N 天的会话日志，0=全部（默认 30）")
@@ -984,9 +1127,12 @@ def main():
             print("  %-24s %d 轮" % (r[0], r[1]))
         return
 
-    server = ThreadingHTTPServer(("127.0.0.1", g_args.port), Handler)
-    url = "http://127.0.0.1:%d" % g_args.port
+    server = ThreadingHTTPServer((g_args.host, g_args.port), Handler)
+    browser_host = "127.0.0.1" if g_args.host == "0.0.0.0" else g_args.host
+    url = "http://%s:%d" % (browser_host, g_args.port)
     print("[codex-model-watch] 面板地址: %s  （Ctrl+C 退出）" % url)
+    if g_args.host == "0.0.0.0":
+        print("[codex-model-watch] 已开启局域网访问：在同一网络的设备上打开 http://本机局域网IP:%d" % g_args.port)
     if not g_args.no_open:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
