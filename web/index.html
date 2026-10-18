@@ -574,9 +574,13 @@ function probeKind(p){
 }
 function probeEvidence(p){
   const parts=[];
+  if(p.engine_model && !p.engine_mismatch) parts.push(`engine ${p.engine_model}`);
   if(p.safety_header) parts.push(`safety ${p.safety_header}`);
   if(p.faster_model) parts.push(`faster-model ${p.faster_model}`);
   if(p.turn_state_len!=null) parts.push(`turn-state ${p.turn_state_len}（参考）`);
+  if(p.primary_used_percent!=null) parts.push(`primary ${p.primary_used_percent}%`);
+  if(p.primary_window_minutes!=null) parts.push(`窗口 ${p.primary_window_minutes}min`);
+  if(p.active_limit) parts.push(`limit ${p.active_limit}`);
   if(p.request_id) parts.push(`request-id ${p.request_id}`);
   if(p.cf_ray) parts.push(`cf-ray ${p.cf_ray}`);
   return parts.join(' · ');
@@ -585,6 +589,7 @@ function probeReason(p,kind){
   let base;
   if(kind==='quick'){
     if(p.error) base=`探测失败：${p.error}${p.latency_ms?` · 耗时 ${fmtDur(p.latency_ms)}`:''}`;
+    else if(p.engine_mismatch) base=`请求 ${p.requested} → 引擎 ${p.engine_model||p.engine_id}${p.served?`（返回模型 ${p.served}）`:''} · 引擎与请求不一致${p.latency_ms?` · 耗时 ${fmtDur(p.latency_ms)}`:''}`;
     else if(!p.served) base='没有拿到响应模型。';
     else base=`请求 ${p.requested} → 实际 ${p.served}${p.swapped?' · 请求与返回不一致':''}${p.latency_ms?` · 耗时 ${fmtDur(p.latency_ms)}`:''}`;
   }else{
@@ -915,6 +920,8 @@ async function runProbe(){
       body:JSON.stringify({model})})).json();
     if(r.error){
       showToast({tone:'error',title:'不确定',message:r.error,timeout:7000});
+    }else if(r.engine_mismatch){
+      showToast({tone:'error',title:'不通过',message:`请求 ${r.requested}，实际引擎 ${r.engine_model||r.engine_id}${r.served?`（返回 ${r.served}）`:''}（${r.latency_ms}ms）`,timeout:7000});
     }else if(r.swapped){
       showToast({tone:'error',title:'不通过',message:`请求 ${r.requested}，实际 ${r.served}（${r.latency_ms}ms）`,timeout:7000});
     }else{

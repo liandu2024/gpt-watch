@@ -12,11 +12,11 @@ codex-model-watch —— 本地监控 Codex 的模型使用、额度水位、容
      注意：实测 Codex 会把被偷换后的模型一致化写进日志（请求字段与实际字段相同），
      因此「被偷换成了什么」无法从日志还原 —— 这正是探针存在的意义。
   2. 探针侧：用你本地的 Codex 登录态（~/.codex/auth.json）向
-     chatgpt.com/backend-api/codex/responses 发一条最小请求，读取 SSE
-     response.created 事件里服务端实际派出的模型，即可即时验证「请求 X 会被派什么」。
+     chatgpt.com/backend-api/codex/responses 发一条最小请求，优先读取 SSE
+     timing_metrics.engine_ids 里的底层引擎 ID，缺失时回退到 response.created 的模型名。
      每次探针只消耗极少量额度，可手动触发也可定时执行。
-     ⚠ 2026-10 实测：服务端自报模型已不可信（被软换时自报仍为请求模型名），
-     快探针只能证明"链路活着"，不能证明"货是真的"。
+     ⚠ 2026-10 实测：服务端自报模型已不可信（被软换时自报仍为请求模型名）；
+     engine_ids 是更直接的信号，只有引擎 ID 缺失时才只能证明"链路活着"。
   3. 深度金丝雀（canary，2026-10 新增）：发一道固定的多步推理题（effort=high），
      测「首字延迟 + 推理深度 + 答案正确性」。真旗舰模型慢而深（TTFT 数秒、
      reasoning 上百 token），被换成的轻量模型秒回浅答。这是目前唯一能识破
@@ -29,6 +29,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -72,6 +73,8 @@ def db_connect(db_path):
         ts TEXT PRIMARY KEY, requested TEXT, served TEXT, swapped INTEGER,
         latency_ms INTEGER, safety_header TEXT, error TEXT,
         turn_state_len INTEGER, faster_model TEXT, request_id TEXT, cf_ray TEXT,
+        engine_id TEXT, engine_model TEXT, engine_mismatch INTEGER,
+        primary_used_percent REAL, primary_window_minutes INTEGER, active_limit TEXT,
         kind TEXT DEFAULT 'quick');
     CREATE TABLE IF NOT EXISTS threads(
         thread_id TEXT PRIMARY KEY, requested TEXT);
@@ -85,7 +88,13 @@ def db_connect(db_path):
                 "ALTER TABLE probes ADD COLUMN turn_state_len INTEGER",
                 "ALTER TABLE probes ADD COLUMN faster_model TEXT",
                 "ALTER TABLE probes ADD COLUMN request_id TEXT",
-                "ALTER TABLE probes ADD COLUMN cf_ray TEXT"):
+                "ALTER TABLE probes ADD COLUMN cf_ray TEXT",
+                "ALTER TABLE probes ADD COLUMN engine_id TEXT",
+                "ALTER TABLE probes ADD COLUMN engine_model TEXT",
+                "ALTER TABLE probes ADD COLUMN engine_mismatch INTEGER",
+                "ALTER TABLE probes ADD COLUMN primary_used_percent REAL",
+                "ALTER TABLE probes ADD COLUMN primary_window_minutes INTEGER",
+                "ALTER TABLE probes ADD COLUMN active_limit TEXT"):
         try:
             conn.execute(ddl)
         except sqlite3.OperationalError:
@@ -276,6 +285,27 @@ def load_auth(codex_home):
         return None
 
 
+def _model_slug(name):
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def _engine_slug(engine_id):
+    """Turn 'gpt56lun-codex-...' into 'gpt56lun' for model comparison."""
+    s = (engine_id or "").strip().lower()
+    if "-codex" in s:
+        s = s.split("-codex", 1)[0]
+    return _model_slug(s)
+
+
+def _engine_mismatch(requested, engine_id):
+    req = _model_slug(requested)
+    eng = _engine_slug(engine_id)
+    if not req or not eng:
+        return 0
+    known = lambda value: value.startswith("gpt") or bool(re.match(r"^o\d", value))
+    return 1 if known(req) and known(eng) and req != eng else 0
+
+
 def run_probe(codex_home, model):
     import urllib.request
     import urllib.error
@@ -298,7 +328,9 @@ def run_probe(codex_home, model):
                  ("User-Agent", "codex_cli_rs/0.154.0")]:
         req.add_header(k, v)
     t0 = time.time()
-    served, safety, faster, turn_state, request_id, cf_ray, error = "", "", "", "", "", "", None
+    served, safety, faster, turn_state, request_id, cf_ray = "", "", "", "", "", ""
+    engine_id, engine_model, error = "", "", None
+    primary_used = primary_window = active_limit = None
     try:
         resp = urllib.request.urlopen(req, timeout=90)
         safety = resp.headers.get("x-codex-safety-buffering-enabled", "") or ""
@@ -307,20 +339,40 @@ def run_probe(codex_home, model):
         request_id = (resp.headers.get("x-request-id") or resp.headers.get("request-id")
                       or resp.headers.get("openai-request-id") or "")
         cf_ray = resp.headers.get("cf-ray", "") or ""
+        header_engine = (resp.headers.get("x-codex-engine-id")
+                         or resp.headers.get("x-codex-engine-ids") or "")
+        primary_raw = (resp.headers.get("x-codex-primary-used-percent") or "").strip()
+        window_raw = (resp.headers.get("x-codex-primary-window-minutes") or "").strip()
+        active_limit = (resp.headers.get("x-codex-active-limit") or "").strip() or None
+        try:
+            primary_used = float(primary_raw.rstrip("%")) if primary_raw else None
+        except ValueError:
+            primary_used = None
+        try:
+            primary_window = int(float(window_raw)) if window_raw else None
+        except ValueError:
+            primary_window = None
         buf = b""
         while True:
             chunk = resp.read(4096)
             if not chunk:
                 break
             buf += chunk
-            if b"response.created" in buf:
+            if b"response.created" in buf and (b"engine_ids" in buf or b"response.completed" in buf):
                 break
-            if len(buf) > 200000:
+            if b"response.completed" in buf:
+                break
+            if len(buf) > 1500000:
                 break
         text = buf.decode(errors="replace")
-        i = text.find('"model":"')
-        if i >= 0:
-            served = text[i + 9:text.find('"', i + 9)]
+        sm = re.search(r'"model"\s*:\s*"([^"]+)"', text)
+        if sm:
+            served = sm.group(1)
+        m = re.search(r'"engine_ids"\s*:\s*"([^"]+)"', text)
+        if not m:
+            m = re.search(r'"engine_ids"\s*:\s*\[\s*"([^"]+)"', text)
+        engine_id = (m.group(1) if m else "") or header_engine
+        engine_model = _engine_slug(engine_id)
         if not served:
             error = "响应里没有找到模型字段"
     except urllib.error.HTTPError as e:
@@ -332,20 +384,29 @@ def run_probe(codex_home, model):
     except Exception as e:
         error = str(e)[:200]
     latency = int((time.time() - t0) * 1000)
-    swapped = 1 if (served and model and served != model) else 0
+    engine_mismatch = _engine_mismatch(model, engine_id)
+    swapped = 1 if (served and model and served != model) or engine_mismatch else 0
     turn_state_len = len(turn_state) if turn_state else None
     row = (iso_now(), model, served, swapped, latency, safety, error,
-           turn_state_len, faster, request_id, cf_ray)
+           turn_state_len, faster, request_id, cf_ray,
+           engine_id, engine_model, engine_mismatch,
+           primary_used, primary_window, active_limit)
     conn = db_connect(db_path())
     with g_lock:
         conn.execute("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error, "
-                     "kind, turn_state_len, faster_model, request_id, cf_ray) "
-                     "VALUES(?,?,?,?,?,?,?,'quick',?,?,?,?)", row)
+                     "kind, turn_state_len, faster_model, request_id, cf_ray, "
+                     "engine_id, engine_model, engine_mismatch, primary_used_percent, "
+                     "primary_window_minutes, active_limit) "
+                     "VALUES(?,?,?,?,?,?,?,'quick',?,?,?,?,?,?,?,?,?,?)", row)
         conn.commit()
     return {"ts": row[0], "requested": model, "served": served, "swapped": bool(swapped),
             "latency_ms": latency, "safety_header": safety, "error": error,
             "turn_state_len": turn_state_len, "faster_model": faster,
-            "request_id": request_id, "cf_ray": cf_ray}
+            "request_id": request_id, "cf_ray": cf_ray,
+            "engine_id": engine_id, "engine_model": engine_model,
+            "engine_mismatch": bool(engine_mismatch),
+            "primary_used_percent": primary_used,
+            "primary_window_minutes": primary_window, "active_limit": active_limit}
 
 
 # ---------------------------------------------------------------- 深度金丝雀
@@ -821,6 +882,10 @@ def api_data(conn, days=0, pages=None, probe_q=""):
             str(row.get("turn_state_len") or ""),
             row.get("faster_model") or "", row.get("request_id") or "",
             row.get("cf_ray") or "", row.get("safety_header") or "",
+            row.get("engine_id") or "", row.get("engine_model") or "",
+            str(row.get("primary_used_percent") or ""),
+            str(row.get("primary_window_minutes") or ""),
+            row.get("active_limit") or "",
             "自报" if kind != "quick" else "",
             ("偷换" if row.get("swapped") else "一致") if kind == "quick" else "",
         ]).lower()
